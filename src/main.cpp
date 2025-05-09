@@ -2,6 +2,8 @@
 #include <SPI.h>
 #include "df_can.h"
 
+#define DEBUG
+
 #define BAUD_RATE 115200
 
 enum class status_code : uint8_t
@@ -32,7 +34,6 @@ MCPCAN CAN(SPI_CS_PIN);
 
 long current_position = 0;
 bool stop_requested = false;
-String last_command = "";
 
 void setup()
 {
@@ -50,11 +51,9 @@ void setup()
     if (CAN_OK == CAN.begin(CAN_1000KBPS))
       mode0(0x001, 0, 0, 0, 0);
 
-      break;
+    break;
     delay(100);
   } while (count--);
-
-
 }
 
 void loop()
@@ -63,7 +62,6 @@ void loop()
   {
     String command = Serial.readStringUntil('\n');
     command.trim();
-    last_command = command;
 
     if (command.startsWith("H"))
     {
@@ -83,33 +81,33 @@ void loop()
             if (cmd == "S")
             {
               stop_requested = true;
+              mode0(0x001, 0, 0, 0, 0);
               sendCurrentStatus(status_code::CANCEL, current_position);
               return;
             }
           }
         }
+
       }
       mode0(0x001, 0, 0, 0, 0);
       current_position = 0;
-      sendCurrentStatus(status_code::ENDED, current_position);
+      sendCurrentStatus(status_code::ENDED, current_position);        
+  
     }
-
     else if (command.startsWith("S"))
     {
       stop_requested = true;
       mode0(0x001, 0, 0, 0, 0);
       sendCurrentStatus(status_code::ENDED, current_position);
     }
-
     else if (command.startsWith("U"))
     {
-      String numberPart = command.substring(1);
-      if (numberPart.length() > 0)
+      String number_part = command.substring(1);
+      if (number_part.length() > 0)
       {
-        uint32_t upStep = numberPart.toInt();
-
+        uint32_t num_step = number_part.toInt();
         stop_requested = false;
-        moveWithStep(upStep, 0);
+        moveWithStep(num_step, 0);
         sendCurrentStatus(status_code::ENDED, current_position);
       }
       else
@@ -117,15 +115,14 @@ void loop()
         sendCurrentStatus(status_code::ERROR_CMD, current_position);
       }
     }
-
     else if (command.startsWith("D"))
     {
-      String numberPart = command.substring(1);
-      if (numberPart.length() > 0)
+      String number_part = command.substring(1);
+      if (number_part.length() > 0)
       {
-        uint32_t downStep = command.substring(1).toInt();
+        uint32_t num_step = command.substring(1).toInt();
         stop_requested = false;
-        moveWithStep(downStep, 1);
+        moveWithStep(num_step, 1);
         sendCurrentStatus(status_code::ENDED, current_position);
       }
       else
@@ -133,11 +130,10 @@ void loop()
         sendCurrentStatus(status_code::ERROR_CMD, current_position);
       }
     }
-
     else if (command.startsWith("M"))
     {
-      String numberPart = command.substring(1);
-      if (numberPart.length() > 0)
+      String number_part = command.substring(1);
+      if (number_part.length() > 0)
       {
         uint32_t pwmTarget = command.substring(1).toInt();
         stop_requested = false;
@@ -151,7 +147,6 @@ void loop()
         sendCurrentStatus(status_code::ERROR_CMD, current_position);
       }
     }
-
     else if (command.startsWith("P"))
     {
       sendCurrentStatus(status_code::ENDED, current_position);
@@ -174,7 +169,6 @@ void loop()
         sendCurrentStatus(status_code::UNKNOWN_CMD, current_position);
       }
     }
-
     else
     {
       sendCurrentStatus(status_code::UNKNOWN_CMD, current_position);
@@ -208,6 +202,10 @@ void sendCurrentStatus(status_code status_code, long position)
   memcpy(&packet[1], posStr, 11);
 
   Serial.write(packet, sizeof(packet));
+
+#ifdef DEBUG
+  Serial.println();
+#endif
 }
 
 /**
@@ -248,10 +246,11 @@ void moveWithStep(uint32_t total_steps, uint8_t dir)
 
     if (dir == 1 && digitalRead(LS_PIN) == HIGH)
     {
+      current_position = 0;
       sendCurrentStatus(status_code::OVER_LOWER_LIMIT, current_position);
+
       return;
     }
-
 
     uint16_t step = (steps_remaining >= STEP_SIZE) ? STEP_SIZE : steps_remaining;
 
@@ -270,8 +269,8 @@ void moveWithStep(uint32_t total_steps, uint8_t dir)
         if (cmd == "S")
         {
           stop_requested = true;
-          sendCurrentStatus(status_code::CANCEL, current_position);
           mode0(0x001, 0, 0, 0, 0); // Emergency stop
+          sendCurrentStatus(status_code::CANCEL, current_position);
           return;
         }
       }
@@ -284,10 +283,11 @@ void moveWithStep(uint32_t total_steps, uint8_t dir)
       current_position -= step;
     sendCurrentStatus(status_code::PENDING, current_position);
     steps_remaining -= step;
+
   }
 
+  
   mode0(0x001, 0, 0, 0, 0);
-
   sendCurrentStatus(status_code::ENDED, current_position);
 }
 
@@ -302,5 +302,23 @@ void mode0(uint16_t can_id, uint8_t ena, uint8_t dir, uint32_t pulse_target, uin
   data[5] = (uint8_t)(pulse_target >> 16);
   data[6] = (uint8_t)(pps);
   data[7] = (uint8_t)(pps >> 8);
-  CAN.sendMsgBuf(can_id, 0, 8, data);
+  byte resSendMsgBuf = CAN.sendMsgBuf(can_id, 0, 8, data);
+
+#ifdef DEBUG
+
+  String can_send_msg_return = "CAN_OK";
+  if (resSendMsgBuf == CAN_GETTXBFTIMEOUT)
+    can_send_msg_return = "CAN_GETTXBFTIMEOUT";
+  if (resSendMsgBuf == CAN_SENDMSGTIMEOUT)
+    can_send_msg_return = "CAN_SENDMSGTIMEOUT";
+  if (resSendMsgBuf == CAN_FAIL)
+    can_send_msg_return = "CAN_FAIL";
+  if (resSendMsgBuf == CAN_FAILTX)
+    can_send_msg_return = "CAN_FAILTX";
+
+  Serial.println(can_send_msg_return);
+
+#endif
+
+
 }

@@ -174,9 +174,8 @@ class MotorControlGUI(QMainWindow):
             self.status_display.append(f"Error reading serial: {str(e)}")
             
     def process_response(self, data):
-        # Unpack the data (1 status byte + 4 position bytes)
         status_string_byte = data[0]
-        position_string_bytes = data[1:11]
+        position_string_bytes = data[1:]
 
         position = int(position_string_bytes)
         
