@@ -5,6 +5,8 @@
 #define DEBUG
 
 #define BAUD_RATE 115200
+#define ReadWriteOneByte SPI.transfer
+#define Read() SPI.transfer(0x00)
 
 enum class status_code : uint8_t
 {
@@ -12,11 +14,12 @@ enum class status_code : uint8_t
   ERROR_CMD,
   PENDING,
   CANCEL,
+  ENDED,
   OVER_UPPER_LIMIT,
   OVER_LOWER_LIMIT,
-  ENDED,
-  TRUE,
-  FALSE,
+  CAN_ERROR,
+  REACHED_SENSOR,
+  UNREACHED_SENSOR
 };
 
 void mode0(uint16_t can_id, uint8_t ena, uint8_t dir, uint32_t pulse_target, uint16_t pps);
@@ -34,6 +37,7 @@ MCPCAN CAN(SPI_CS_PIN);
 
 long current_position = 0;
 bool stop_requested = false;
+bool can_error = false;
 
 void setup()
 {
@@ -49,9 +53,12 @@ void setup()
   {
     CAN.init();
     if (CAN_OK == CAN.begin(CAN_1000KBPS))
+    {
       mode0(0x001, 0, 0, 0, 0);
 
-    break;
+      break;
+    }
+
     delay(100);
   } while (count--);
 }
@@ -68,6 +75,11 @@ void loop()
       while (digitalRead(LS_PIN) == LOW)
       {
         mode0(0x001, 1, 1, STEP_SIZE, PULSE_PER_SEC);
+        if (can_error)
+        {
+          sendCurrentStatus(status_code::CAN_ERROR, current_position);
+          return;
+        }
         current_position -= STEP_SIZE;
         sendCurrentStatus(status_code::PENDING, current_position);
 
@@ -87,18 +99,16 @@ void loop()
             }
           }
         }
-
       }
       mode0(0x001, 0, 0, 0, 0);
       current_position = 0;
-      sendCurrentStatus(status_code::ENDED, current_position);        
-  
+      sendCurrentStatus(status_code::ENDED, current_position);
     }
     else if (command.startsWith("S"))
     {
       stop_requested = true;
       mode0(0x001, 0, 0, 0, 0);
-      sendCurrentStatus(status_code::ENDED, current_position);
+      sendCurrentStatus(status_code::CANCEL, current_position);
     }
     else if (command.startsWith("U"))
     {
@@ -108,7 +118,6 @@ void loop()
         uint32_t num_step = number_part.toInt();
         stop_requested = false;
         moveWithStep(num_step, 0);
-        sendCurrentStatus(status_code::ENDED, current_position);
       }
       else
       {
@@ -123,7 +132,6 @@ void loop()
         uint32_t num_step = command.substring(1).toInt();
         stop_requested = false;
         moveWithStep(num_step, 1);
-        sendCurrentStatus(status_code::ENDED, current_position);
       }
       else
       {
@@ -140,7 +148,6 @@ void loop()
         uint32_t diff = (pwmTarget > current_position) ? (pwmTarget - current_position) : (current_position - pwmTarget);
         uint8_t dir = (pwmTarget > current_position) ? 0 : 1;
         moveWithStep(diff, dir);
-        sendCurrentStatus(status_code::ENDED, current_position);
       }
       else
       {
@@ -157,11 +164,11 @@ void loop()
       {
         if (command[1] == 'L')
         {
-          sendCurrentStatus(digitalRead(LS_PIN) ? status_code::TRUE : status_code::FALSE, current_position);
+          sendCurrentStatus(digitalRead(LS_PIN) ? status_code::REACHED_SENSOR : status_code::UNREACHED_SENSOR, current_position);
         }
         if (command[1] == 'U')
         {
-          sendCurrentStatus(digitalRead(US_PIN) ? status_code::TRUE : status_code::FALSE, current_position);
+          sendCurrentStatus(digitalRead(US_PIN) ? status_code::REACHED_SENSOR : status_code::UNREACHED_SENSOR, current_position);
         }
       }
       else
@@ -180,12 +187,12 @@ void loop()
  * @brief Sends the current status code and position over the serial port.
  *
  * This function creates a 12-byte packet consisting of:
- * - 1 byte: ASCII character representing the status code (0–8)
+ * - 1 byte: ASCII character representing the status code (0–9)
  * - 11 bytes: formatted position as a signed 10-digit number with leading zeros
  *
  * The entire packet is then sent using `Serial.write()`.
  *
- * @param status_code The status code to send (0–8).
+ * @param status_code The status code to send (0–9).
  * @param position The position value to send, formatted as a signed 10-digit string.
  */
 void sendCurrentStatus(status_code status_code, long position)
@@ -248,7 +255,6 @@ void moveWithStep(uint32_t total_steps, uint8_t dir)
     {
       current_position = 0;
       sendCurrentStatus(status_code::OVER_LOWER_LIMIT, current_position);
-
       return;
     }
 
@@ -256,6 +262,11 @@ void moveWithStep(uint32_t total_steps, uint8_t dir)
 
     // Execute movement
     mode0(0x001, 1, dir, step, PULSE_PER_SEC);
+    if (can_error)
+    {
+      sendCurrentStatus(status_code::CAN_ERROR, current_position);
+      return;
+    }
 
     // Non-blocking monitoring (100ms)
     unsigned long start_time = millis();
@@ -283,12 +294,38 @@ void moveWithStep(uint32_t total_steps, uint8_t dir)
       current_position -= step;
     sendCurrentStatus(status_code::PENDING, current_position);
     steps_remaining -= step;
-
   }
-
-  
-  mode0(0x001, 0, 0, 0, 0);
   sendCurrentStatus(status_code::ENDED, current_position);
+  mode0(0x001, 0, 0, 0, 0);
+}
+
+void mcpSetRegister(const INT8U RegAddr, const INT8U value)
+{
+  digitalWrite(SPI_CS_PIN, LOW);
+  ReadWriteOneByte(MCP_WRITE);
+  ReadWriteOneByte(RegAddr);
+  ReadWriteOneByte(value);
+  digitalWrite(SPI_CS_PIN, HIGH);
+}
+
+INT8U mcpReadRegister(const INT8U RegAddr)
+{
+  INT8U ret;
+
+  digitalWrite(SPI_CS_PIN, LOW);
+  ReadWriteOneByte(MCP_READ);
+  ReadWriteOneByte(RegAddr);
+  ret = Read();
+  digitalWrite(SPI_CS_PIN, HIGH);
+
+  return ret;
+}
+void mcpReset()
+{
+  digitalWrite(SPI_CS_PIN, LOW);
+  ReadWriteOneByte(MCP_RESET);
+  digitalWrite(SPI_CS_PIN, HIGH);
+  delay(100);
 }
 
 void mode0(uint16_t can_id, uint8_t ena, uint8_t dir, uint32_t pulse_target, uint16_t pps)
@@ -302,23 +339,18 @@ void mode0(uint16_t can_id, uint8_t ena, uint8_t dir, uint32_t pulse_target, uin
   data[5] = (uint8_t)(pulse_target >> 16);
   data[6] = (uint8_t)(pps);
   data[7] = (uint8_t)(pps >> 8);
-  byte resSendMsgBuf = CAN.sendMsgBuf(can_id, 0, 8, data);
+  can_error = CAN.sendMsgBuf(can_id, 0, 8, data) != CAN_OK;
 
-#ifdef DEBUG
-
-  String can_send_msg_return = "CAN_OK";
-  if (resSendMsgBuf == CAN_GETTXBFTIMEOUT)
-    can_send_msg_return = "CAN_GETTXBFTIMEOUT";
-  if (resSendMsgBuf == CAN_SENDMSGTIMEOUT)
-    can_send_msg_return = "CAN_SENDMSGTIMEOUT";
-  if (resSendMsgBuf == CAN_FAIL)
-    can_send_msg_return = "CAN_FAIL";
-  if (resSendMsgBuf == CAN_FAILTX)
-    can_send_msg_return = "CAN_FAILTX";
-
-  Serial.println(can_send_msg_return);
-
-#endif
-
+  if (can_error)
+  {
+    // Read ELFG Register
+    uint8_t eflg = mcpReadRegister(0x2D);
+    if ((eflg & (1 << 5)) || // Bus-Off (TXBO)
+        (eflg & (1 << 4)) || // TX Passive (TXEP)
+        (eflg & (1 << 2)))   // TX Warning (TXWAR)
+    {
+      mcpReset(); // Reset only for transmission-related errors
+    }
+  }
 
 }
